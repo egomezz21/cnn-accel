@@ -4,3 +4,5 @@ __pycache__/
 *.fst
 *.vcd
 results.xml
+model/data/
+*.pt

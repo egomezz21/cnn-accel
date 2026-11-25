@@ -55,79 +55,114 @@ def fc_int(x, w, b):
 
     return w @ x +b
 
-def forward(img):
+def forward(img, trace=None):
     # img: (1, 28, 28) floats in [0, 1]
     # TODO: quantize input, then conv1 → requant → pool → conv2 → requant → pool
     #       → flatten → fc1 → requant → fc2 → requant → fc3 → return the 10 scores
 
     x = np.round(img * 127).astype(np.int64)    # quantize input: (1, 28, 28), values 0..127
 
+    if trace is not None:
+        trace["in"] = x
+    
     acc = conv2d_int(x, p["conv1_w"], p["conv1_b"])
     x = requant(acc, int(p["conv1_m"]), int(p["conv1_n"]))
+
+    if trace is not None:
+        trace["conv1_acc"] = acc
+        trace["conv1_out"] = x
+
     x = maxpool2(x)
+    if trace is not None:
+        trace["pool1"] = x
+
     # TODO: conv2 → requant → pool
     acc = conv2d_int(x, p["conv2_w"], p["conv2_b"])
     x = requant(acc, int(p["conv2_m"]), int(p["conv2_n"]))
+
+    if trace is not None:
+        trace["conv2_acc"] = acc
+        trace["conv2_out"] = x
+
     x = maxpool2(x)
+    if trace is not None:
+        trace["pool2"] = x
+    
     # TODO: flatten
     x = x.flatten()
+    if trace is not None:
+        trace["flat"] = x
+
     # TODO: fc1 → requant, fc2 → requant
     acc = fc_int(x, p["fc1_w"], p["fc1_b"])
     x = requant(acc, int(p["fc1_m"]), int(p["fc1_n"]))
 
+    if trace is not None:
+        trace["fc1_acc"] = acc
+        trace["fc1_out"] = x
+
     acc = fc_int(x, p["fc2_w"], p["fc2_b"])
     x = requant(acc, int(p["fc2_m"]), int(p["fc2_n"]))
+
+    if trace is not None:
+        trace["fc2_acc"] = acc
+        trace["fc2_out"] = x
+
     # TODO: fc3 — no requant, return the raw int scores
     x = fc_int(x, p["fc3_w"], p["fc3_b"])
+
+    if trace is not None:
+        trace["scores"] = x
 
     return x
 
 
+if __name__ == "__main__":
+    # unit tests and accuracy loop go here, indented
+    assert requant(1000, 24073, 24) == 1
+    assert requant(-500, 24073, 24) == 0
+    assert requant(10**6, 24073, 24) == 127
+    print("requant tests passed")
 
-assert requant(1000, 24073, 24) == 1
-assert requant(-500, 24073, 24) == 0
-assert requant(10**6, 24073, 24) == 127
-print("requant tests passed")
+    rng = np.random.default_rng(0)                       # seeded, so it's reproducible
+    x = rng.integers(0, 128, size=(6, 12, 12))           # like real int8 activations
+    w = rng.integers(-127, 128, size=(16, 6, 5, 5))
+    b = rng.integers(-1000, 1000, size=(16,))
 
-rng = np.random.default_rng(0)                       # seeded, so it's reproducible
-x = rng.integers(0, 128, size=(6, 12, 12))           # like real int8 activations
-w = rng.integers(-127, 128, size=(16, 6, 5, 5))
-b = rng.integers(-1000, 1000, size=(16,))
+    mine = conv2d_int(x, w, b)
+    ref = F.conv2d(torch.tensor(x[None], dtype=torch.float64),
+                torch.tensor(w, dtype=torch.float64),
+                torch.tensor(b, dtype=torch.float64))[0].numpy()
 
-mine = conv2d_int(x, w, b)
-ref = F.conv2d(torch.tensor(x[None], dtype=torch.float64),
-               torch.tensor(w, dtype=torch.float64),
-               torch.tensor(b, dtype=torch.float64))[0].numpy()
+    assert mine.shape == (16, 8, 8), mine.shape
+    assert np.array_equal(mine, ref.astype(np.int64))
+    print("conv2d_int tests passed")
 
-assert mine.shape == (16, 8, 8), mine.shape
-assert np.array_equal(mine, ref.astype(np.int64))
-print("conv2d_int tests passed")
+    # maxpool
+    x = rng.integers(0, 128, size=(6, 24, 24))
+    ref = F.max_pool2d(torch.tensor(x, dtype=torch.float64), 2).numpy()
+    assert np.array_equal(maxpool2(x), ref.astype(np.int64))
 
-# maxpool
-x = rng.integers(0, 128, size=(6, 24, 24))
-ref = F.max_pool2d(torch.tensor(x, dtype=torch.float64), 2).numpy()
-assert np.array_equal(maxpool2(x), ref.astype(np.int64))
+    # fc
+    x = rng.integers(0, 128, size=(256,))
+    w = rng.integers(-127, 128, size=(120, 256))
+    b = rng.integers(-1000, 1000, size=(120,))
+    ref = F.linear(torch.tensor(x, dtype=torch.float64),
+                torch.tensor(w, dtype=torch.float64),
+                torch.tensor(b, dtype=torch.float64)).numpy()
+    assert np.array_equal(fc_int(x, w, b), ref.astype(np.int64))
 
-# fc
-x = rng.integers(0, 128, size=(256,))
-w = rng.integers(-127, 128, size=(120, 256))
-b = rng.integers(-1000, 1000, size=(120,))
-ref = F.linear(torch.tensor(x, dtype=torch.float64),
-               torch.tensor(w, dtype=torch.float64),
-               torch.tensor(b, dtype=torch.float64)).numpy()
-assert np.array_equal(fc_int(x, w, b), ref.astype(np.int64))
+    print("maxpool2 and fc_int tests passed")
 
-print("maxpool2 and fc_int tests passed")
+    tf = transforms.ToTensor()
+    test = datasets.MNIST("data", train=False, download=True, transform=tf)
 
-tf = transforms.ToTensor()
-test = datasets.MNIST("data", train=False, download=True, transform=tf)
-
-N = 10000
-correct = 0
-for i in range(N):
-    img, label = test[i]
-    scores = forward(img.numpy())
-    # TODO: if the index of the biggest score equals label, count it
-    if np.argmax(scores) == label:
-        correct += 1
-print(f"golden model accuracy on {N} images: {correct / N:.4f}")
+    N = 10000
+    correct = 0
+    for i in range(N):
+        img, label = test[i]
+        scores = forward(img.numpy())
+        # TODO: if the index of the biggest score equals label, count it
+        if np.argmax(scores) == label:
+            correct += 1
+    print(f"golden model accuracy on {N} images: {correct / N:.4f}")
